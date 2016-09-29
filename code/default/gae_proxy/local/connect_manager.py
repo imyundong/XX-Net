@@ -122,16 +122,16 @@ class Connect_pool():
             if only_h1 and sock.h2:
                 continue
 
-            time = self.pool[sock]
-            if time < fastest_time or not fastest_sock:
-                fastest_time = time
+            hs_time = self.pool[sock]
+            if hs_time < fastest_time or not fastest_sock:
+                fastest_time = hs_time
                 fastest_sock = sock
 
-        if not fastest_sock:
-            raise Exception("get no ssl")
+        if not fastest_sock.h2:
+            self.h1_num -= 1
 
         self.pool.pop(fastest_sock)
-        return (fastest_time, fastest_sock)
+        return fastest_time, fastest_sock
 
     def get_slowest(self):
         self.not_empty.acquire()
@@ -147,8 +147,11 @@ class Connect_pool():
                     slowest_handshake_time = handshake_time
                     slowest_sock = sock
 
+            if not slowest_sock.h2:
+                self.h1_num -= 1
+
             self.pool.pop(slowest_sock)
-            return (slowest_handshake_time, slowest_sock)
+            return slowest_handshake_time, slowest_sock
         finally:
             self.not_empty.release()
 
@@ -159,9 +162,13 @@ class Connect_pool():
             pool = tuple(self.pool)
             for sock in pool:
                 inactive_time = time.time() -sock.last_use_time
-                #xlog.debug("inactive_time:%d", inactive_time * 1000)
+                # xlog.debug("inactive_time:%d", inactive_time * 1000)
                 if inactive_time >= maxtime:
                     return_list.append(sock)
+
+                    if not sock.h2:
+                        self.h1_num -= 1
+
                     del self.pool[sock]
 
             return return_list
@@ -175,6 +182,7 @@ class Connect_pool():
                 sock.close()
 
             self.pool = {}
+            self.h1_num = 0
         finally:
             self.pool_lock.release()
 
@@ -205,7 +213,11 @@ class Https_connection_manager(object):
 
         # ref: http://vincent.bernat.im/en/blog/2011-ssl-session-reuse-rfc5077.html
         self.openssl_context = SSLConnection.context_builder(ca_certs=g_cacertfile)
-        self.openssl_context.set_session_id(binascii.b2a_hex(os.urandom(10)))
+        try:
+            self.openssl_context.set_session_id(binascii.b2a_hex(os.urandom(10)))
+        except:
+            pass
+
         if hasattr(OpenSSL.SSL, 'SESS_CACHE_BOTH'):
             self.openssl_context.set_session_cache_mode(OpenSSL.SSL.SESS_CACHE_BOTH)
 
@@ -227,7 +239,7 @@ class Https_connection_manager(object):
         p.start()
 
         if self.connection_pool_min_num:
-            p = threading.Thread(target=self.create_connection_daemon)
+            p = threading.Thread(target=self.keep_connection_daemon)
             p.daemon = True
             p.start()
 
@@ -298,61 +310,40 @@ class Https_connection_manager(object):
                 google_ip.report_connect_closed(ssl_sock.ip, "slowest %d" % ssl_sock.handshake_time)
                 ssl_sock.close()
 
-    def create_connection_daemon(self):
-        connect_start_num = 0
-
+    def keep_connection_daemon(self):
         while connect_control.keep_running:
-            time.sleep(0.1)
             if not connect_control.allow_connect():
                 time.sleep(5)
                 continue
 
-            if self.thread_num > self.max_thread_num:
-                continue
-
-            target_conn_num = (1 - (connect_control.inactive_time()/(10*60))) * self.connection_pool_min_num
-            if self.new_conn_pool.qsize() > target_conn_num:
-                time.sleep(1)
-                continue
-
-            self.thread_num_lock.acquire()
-            self.thread_num += 1
-            self.thread_num_lock.release()
-            p = threading.Thread(target=self.connect_process)
-            p.start()
-            connect_start_num += 1
-
-            if connect_start_num > 10:
+            if self.new_conn_pool.qsize() > self.connection_pool_min_num:
                 time.sleep(5)
-                connect_start_num = 0
+                continue
+
+            self.connect_process()
 
     def connect_process(self):
         try:
             ip_str = google_ip.get_gws_ip()
             if not ip_str:
                 time.sleep(60)
-                xlog.warning("no enough ip")
+                # xlog.warning("no enough ip")
                 return
 
-            port = 443
             #xlog.debug("create ssl conn %s", ip_str)
-            ssl_sock = self._create_ssl_connection( (ip_str, port) )
-            if ssl_sock:
-                ssl_sock.last_use_time = time.time()
+            ssl_sock = self._create_ssl_connection( (ip_str, 443) )
+            if not ssl_sock:
+                return
 
-                if self.new_conn_pool.qsize() >= self.connection_pool_max_num and self.ssl_timeout_cb:
-                    self.ssl_timeout_cb(ssl_sock)
-                else:
-                    self.new_conn_pool.put((ssl_sock.handshake_time, ssl_sock))
-        finally:
-            self.thread_num_lock.acquire()
-            self.thread_num -= 1
-            self.thread_num_lock.release()
+            self.new_conn_pool.put((ssl_sock.handshake_time, ssl_sock))
+        except:
+            pass
 
     def create_more_connection_worker(self):
         while connect_control.allow_connect() and \
                 self.thread_num < self.max_thread_num and \
-                self.new_conn_pool.qsize() < self.https_new_connect_num:
+                (self.new_conn_pool.qsize() < self.https_new_connect_num or
+                    self.new_conn_pool.qsize(only_h1=True) < 1):
 
             self.thread_num_lock.acquire()
             self.thread_num += 1
@@ -371,25 +362,34 @@ class Https_connection_manager(object):
     def connect_thread(self, sleep_time=0):
         time.sleep(sleep_time)
         try:
-            while self.new_conn_pool.qsize() < self.https_new_connect_num:
+            while self.new_conn_pool.qsize() < self.https_new_connect_num or \
+                    self.new_conn_pool.qsize(only_h1=True) < 1:
+
+                if self.new_conn_pool.qsize() > self.connection_pool_max_num:
+                    break
+
+                if not connect_control.allow_connect():
+                    break
 
                 ip_str = google_ip.get_gws_ip()
                 if not ip_str:
-                    time.sleep(60)
                     xlog.warning("no enough ip")
+                    time.sleep(60)
                     break
 
-                port = 443
                 #xlog.debug("create ssl conn %s", ip_str)
-                ssl_sock = self._create_ssl_connection( (ip_str, port) )
-                if ssl_sock:
-                    ssl_sock.last_use_time = time.time()
-                    if self.new_conn_pool.qsize() >= self.connection_pool_max_num and self.ssl_timeout_cb:
-                        self.ssl_timeout_cb(ssl_sock)
-                    else:
-                        self.new_conn_pool.put((ssl_sock.handshake_time, ssl_sock))
-                elif not connect_control.allow_connect():
-                    break
+                ssl_sock = self._create_ssl_connection( (ip_str, 443) )
+                if not ssl_sock:
+                    continue
+
+                if self.ssl_timeout_cb and \
+                        self.new_conn_pool.qsize() > self.connection_pool_max_num + 1 and \
+                        self.new_conn_pool.qsize() > self.https_new_connect_num + 1 and \
+                        self.new_conn_pool.qsize(only_h1=True) > 2:
+
+                    self.ssl_timeout_cb(ssl_sock)
+                else:
+                    self.new_conn_pool.put((ssl_sock.handshake_time, ssl_sock))
                 time.sleep(1)
         finally:
             self.thread_num_lock.acquire()
@@ -435,7 +435,20 @@ class Https_connection_manager(object):
             ssl_sock.do_handshake()
             time_handshaked = time.time()
 
-            connect_time = int((time_connected - time_begin) * 1000)
+            def verify_SSL_certificate_issuer(ssl_sock):
+                cert = ssl_sock.get_peer_certificate()
+                if not cert:
+                    #google_ip.report_bad_ip(ssl_sock.ip)
+                    #connect_control.fall_into_honeypot()
+                    raise socket.error(' certficate is none')
+
+                issuer_commonname = next((v for k, v in cert.get_issuer().get_components() if k == 'CN'), '')
+                if not issuer_commonname.startswith('Google'):
+                    google_ip.report_connect_fail(ip, force_remove=True)
+                    raise socket.error(' certficate is issued by %r, not Google' % ( issuer_commonname))
+
+            verify_SSL_certificate_issuer(ssl_sock)
+
             handshake_time = int((time_handshaked - time_connected) * 1000)
 
             try:
@@ -459,24 +472,11 @@ class Https_connection_manager(object):
             xlog.debug("create_ssl update ip:%s time:%d h2:%d", ip, handshake_time, ssl_sock.h2)
             ssl_sock.fd = sock.fileno()
             ssl_sock.create_time = time_begin
+            ssl_sock.last_use_time = time.time()
             ssl_sock.received_size = 0
             ssl_sock.load = 0
             ssl_sock.handshake_time = handshake_time
             ssl_sock.host = ''
-
-            def verify_SSL_certificate_issuer(ssl_sock):
-                cert = ssl_sock.get_peer_certificate()
-                if not cert:
-                    #google_ip.report_bad_ip(ssl_sock.ip)
-                    #connect_control.fall_into_honeypot()
-                    raise socket.error(' certficate is none')
-
-                issuer_commonname = next((v for k, v in cert.get_issuer().get_components() if k == 'CN'), '')
-                if not issuer_commonname.startswith('Google'):
-                    google_ip.report_connect_fail(ip, force_remove=True)
-                    raise socket.error(' certficate is issued by %r, not Google' % ( issuer_commonname))
-
-            verify_SSL_certificate_issuer(ssl_sock)
 
             connect_control.report_connect_success()
             return ssl_sock

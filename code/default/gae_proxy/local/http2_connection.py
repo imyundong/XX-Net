@@ -129,6 +129,8 @@ class HTTP2_worker(HTTP_worker):
         # this is the export api
         if len(self.streams) > self.max_concurrent:
             self.accept_task = False
+
+        task.set_state("h2_req")
         self.request_task(task)
 
     def request_task(self, task):
@@ -153,7 +155,7 @@ class HTTP2_worker(HTTP_worker):
                 # None frame to exist
                 break
 
-            xlog.debug("%s Send:%s", self.ip, str(frame))
+            # xlog.debug("%s Send:%s", self.ip, str(frame))
             data = frame.serialize()
             try:
                 self._sock.send(data, flush=False)
@@ -178,20 +180,27 @@ class HTTP2_worker(HTTP_worker):
             try:
                 self._consume_single_frame()
             except Exception as e:
-                #xlog.warn("recv fail:%r", e)
+                xlog.debug("recv fail:%r", e)
                 self.close("recv fail:%r" % e)
 
     def get_rtt_rate(self):
         return self.rtt + len(self.streams) * 100
 
     def close(self, reason=""):
+        self.keep_running = False
         # Notify loop to exit
         # This function may be call by out side http2
         # When gae_proxy found the appid or ip is wrong
         self.send_queue.put(None)
 
         for stream in self.streams.values():
-            self.retry_task_cb(stream.task)
+            if stream.get_head_time:
+                # after get header,
+                # response have send to client
+                # can't retry
+                stream.close(reason=reason)
+            else:
+                self.retry_task_cb(stream.task)
         super(HTTP2_worker, self).close(reason)
 
     def send_ping(self):
@@ -217,7 +226,7 @@ class HTTP2_worker(HTTP_worker):
     def increase_remote_window_size(self, inc_size):
         # check and send blocked frames if window allow
         self.remote_window_size += inc_size
-        xlog.debug("%s increase send win:%d result:%d", self.ip, inc_size, self.remote_window_size)
+        #xlog.debug("%s increase send win:%d result:%d", self.ip, inc_size, self.remote_window_size)
         while len(self.blocked_send_frames):
             frame = self.blocked_send_frames[0]
             if len(frame.data) > self.remote_window_size:
@@ -243,13 +252,13 @@ class HTTP2_worker(HTTP_worker):
 
     def _close_stream_cb(self, stream_id, reason):
         # call by stream to remove from streams list
-        xlog.debug("%s close stream:%d %s", self.ssl_sock.ip, stream_id, reason)
+        #xlog.debug("%s close stream:%d %s", self.ssl_sock.ip, stream_id, reason)
         try:
             del self.streams[stream_id]
         except KeyError:
             pass
 
-        if len(self.streams) < self.max_concurrent and self.remote_window_size > 10000:
+        if self.keep_running and len(self.streams) < self.max_concurrent and self.remote_window_size > 10000:
             self.accept_task = True
 
         self.processed_tasks += 1
@@ -296,8 +305,7 @@ class HTTP2_worker(HTTP_worker):
     def _consume_frame_payload(self, frame, data):
         frame.parse_body(data)
 
-        #xlog.debug("Received frame %s on stream %d", frame.__class__.__name__, frame.stream_id)
-        xlog.debug("%s Recv:%s", self.ip, str(frame))
+        # xlog.debug("%s Recv:%s", self.ip, str(frame))
 
         # Maintain our flow control window. We do this by delegating to the
         # chosen WindowManager.
@@ -307,7 +315,7 @@ class HTTP2_worker(HTTP_worker):
             increment = self.local_window_manager._handle_frame(size)
 
             if increment:
-                xlog.debug("%s frame size:%d increase win:%d", self.ip, size, increment)
+                #xlog.debug("%s frame size:%d increase win:%d", self.ip, size, increment)
                 w = WindowUpdateFrame(0)
                 w.window_increment = increment
                 self._send_cb(w)
@@ -334,10 +342,10 @@ class HTTP2_worker(HTTP_worker):
                 time_now = time.time()
                 rtt = (time_now - ping_time) * 1000
                 if rtt < 0:
-                    xlog.debug("rtt:%f ping_time:%f now:%f", rtt, ping_time, time_now)
+                    xlog.error("rtt:%f ping_time:%f now:%f", rtt, ping_time, time_now)
                 self.rtt = rtt
                 self.ping_on_way -= 1
-                xlog.debug("RTT:%d, on_way:%d", self.rtt, self.ping_on_way)
+                #xlog.debug("RTT:%d, on_way:%d", self.rtt, self.ping_on_way)
                 if self.keep_running and self.ping_on_way == 0:
                     self.accept_task = True
             else:
@@ -378,7 +386,7 @@ class HTTP2_worker(HTTP_worker):
         else:  # pragma: no cover
             # Unexpected frames belong to extensions. Just drop it on the
             # floor, but log so that users know that something happened.
-            xlog.warning("%s Received unknown frame, type %d", self.ip, frame.type)
+            xlog.error("%s Received unknown frame, type %d", self.ip, frame.type)
 
     def _update_settings(self, frame):
 
@@ -401,7 +409,7 @@ class HTTP2_worker(HTTP_worker):
         if SettingsFrame.SETTINGS_MAX_FRAME_SIZE in frame.settings:
             new_size = frame.settings[SettingsFrame.SETTINGS_MAX_FRAME_SIZE]
             if not (FRAME_MAX_LEN <= new_size <= FRAME_MAX_ALLOWED_LEN):
-                xlog.warning("%s Frame size %d is outside of allowed range", self.ip, new_size)
+                xlog.error("%s Frame size %d is outside of allowed range", self.ip, new_size)
 
                 # Tear the connection down with error code PROTOCOL_ERROR
                 self.close("bad max frame size")
